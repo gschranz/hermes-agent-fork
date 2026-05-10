@@ -68,6 +68,10 @@ RUN chmod +x /app/start.sh
 
 ENV HOME=/data
 ENV HERMES_HOME=/data/.hermes
+
+# _hermes_ink_bundle_stale() check (which still looks for the old ink-bundle.js filename, but v5.7's build produces entry-exports.js)
+# always returns True, triggering a full `npm run build` inside every /chat WebSocket request. Setting HERMES_TUI_DIR routes through the
+# early-return path in _make_tui_argv that skips staleness detection entirely. Upstream bug; remove this when v2026.5.x ships the fix.
 ENV HERMES_TUI_DIR=/opt/hermes-agent/ui-tui
 
 # tini wraps start.sh so it runs as PID 1's child instead of as PID 1 itself.

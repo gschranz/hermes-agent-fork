@@ -350,10 +350,12 @@ def _apply_xai_oauth_config(model: str) -> None:
     with config_path.open("w") as f:
         yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
 
-    # Also persist LLM_MODEL in .env so is_config_complete sees it
+    # Persist LLM_MODEL and track the per-provider model so the setup UI can
+    # display it alongside the xAI entry in the "Configured Providers" list.
     if model:
         existing_env = read_env(ENV_FILE)
         existing_env["LLM_MODEL"] = model
+        existing_env["_MODEL_XAI_OAUTH"] = model
         write_env(ENV_FILE, existing_env)
 
 
@@ -409,6 +411,27 @@ async def _poll_xai_device_auth(state: dict) -> None:
 
     state["status"] = "expired"
     print("[xai-oauth] device code expired", flush=True)
+
+
+async def api_oauth_xai_delete(request: Request) -> Response:
+    global _xai_oauth_state
+    if err := guard(request):
+        return err
+    auth_path = Path(HERMES_HOME) / "auth.json"
+    if auth_path.exists():
+        try:
+            data = json.loads(auth_path.read_text(encoding="utf-8"))
+            data.get("providers", {}).pop("xai-oauth", None)
+            if data.get("active_provider") == "xai-oauth":
+                data.pop("active_provider", None)
+            auth_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+    env = read_env(ENV_FILE)
+    env.pop("_MODEL_XAI_OAUTH", None)
+    write_env(ENV_FILE, env)
+    _xai_oauth_state = None
+    return JSONResponse({"ok": True})
 
 
 async def api_oauth_xai_start(request: Request) -> Response:
@@ -1357,8 +1380,9 @@ routes = [
     Route("/setup/api/pairing/deny",            api_pairing_deny,    methods=["POST"]),
     Route("/setup/api/pairing/approved",        api_pairing_approved),
     Route("/setup/api/pairing/revoke",          api_pairing_revoke,  methods=["POST"]),
-    Route("/setup/api/oauth/xai/start",         api_oauth_xai_start, methods=["POST"]),
+    Route("/setup/api/oauth/xai/start",         api_oauth_xai_start,  methods=["POST"]),
     Route("/setup/api/oauth/xai/status",        api_oauth_xai_status),
+    Route("/setup/api/oauth/xai",               api_oauth_xai_delete, methods=["DELETE"]),
 
     # /setup/* typos return a real 404 — not a silent proxy fallthrough.
     Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),

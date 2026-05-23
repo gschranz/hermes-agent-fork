@@ -26,14 +26,15 @@ if [ ! -f /data/.hermes/auth.json ] && [ -n "${HERMES_AUTH_JSON_BOOTSTRAP}" ]; t
   chmod 600 /data/.hermes/auth.json
 fi
 
-# Setup GitHub SSH Access
+# Setup GitHub SSH Access (Fail-Safe)
 if [ -n "$HERMES_SSH_KEY" ]; then
-  mkdir -p ~/.ssh
-  echo "$HERMES_SSH_KEY" > ~/.ssh/id_ed25519
-  chmod 600 ~/.ssh/id_ed25519
-  ssh-keyscan github.com >> ~/.ssh/known_hosts
-  git config --global user.name "Hermes Agent"
-  git config --global user.email "gerald.schranz@gmail.com"
+  mkdir -p ~/.ssh || true
+  # printf ist sicherer als echo bei mehrzeiligen SSH-Keys
+  printf '%s\n' "$HERMES_SSH_KEY" > ~/.ssh/id_ed25519 || true
+  chmod 600 ~/.ssh/id_ed25519 || true
+  ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null || true
+  git config --global user.name "Hermes Agent" || true
+  git config --global user.email "gerald.schranz@gmail.com" || true
 fi
 
 # Clear any stale gateway PID file left over from the previous container.

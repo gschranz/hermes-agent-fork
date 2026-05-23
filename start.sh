@@ -26,6 +26,11 @@ if [ ! -f /data/.hermes/auth.json ] && [ -n "${HERMES_AUTH_JSON_BOOTSTRAP}" ]; t
   chmod 600 /data/.hermes/auth.json
 fi
 
+mkdir -p /root/.ssh && echo "$HERMES_SSH_KEY" > /root/.ssh/id_ed25519 
+chmod 600 /root/.ssh/id_ed25519 && ssh-keyscan github.com >> /root/.ssh/known_hosts 
+git config --global user.name "Hermes Agent" 
+git config --global user.email "gerald.schranz@gmail.com"
+
 # Clear any stale gateway PID file left over from the previous container.
 # `hermes gateway` writes /data/.hermes/gateway.pid on start but does not
 # remove it on SIGTERM. Since /data is a persistent volume, the file

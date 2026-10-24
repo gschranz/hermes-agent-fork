@@ -6,5 +6,6 @@ dockerfilePath = "Dockerfile"
 startCommand = "/app/start.sh"
 healthcheckPath = "/health"
 healthcheckTimeout = 300
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 10
+# "always" statt "on_failure": restart-service.sh fährt PID 1 graceful runter
+# (Exit-Code 0) -> bei on_failure würde Railway NICHT neu starten.
+restartPolicyType = "always"

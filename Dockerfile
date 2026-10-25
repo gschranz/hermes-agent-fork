@@ -27,6 +27,38 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# --- Browser-Automation ohne Chromium-Ballast -------------------------------
+# Hermes' Browser-Toolset spricht die CLI `agent-browser` an. Standard-Engine ist
+# Chrome (Chrome for Testing) -> beim ersten Gebrauch ~650 MB Download, landet im
+# Volume /data (wird mitberechnet und ist nach jedem Volume-Aufräumen weg).
+# Statt dessen: Lightpanda als Engine (browser.engine: lightpanda in config.yaml).
+# Lightpanda ist EIN Binary (~75 MB, Zig, CDP-kompatibel), gemessen 14 MB RSS im
+# Leerlauf vs. mehrere hundert MB bei Chrome. Kein Screenshot-Support — dafür
+# fällt Hermes bei Befehlen, die Lightpanda nicht kann, selbst auf Chrome zurück.
+#
+# ACHTUNG Nightly-Drift: der Release-Tag `nightly` wird täglich überschrieben.
+# Argument-Änderungen brechen den Shim (vgl. lightpanda-shim.sh). Der Build
+# prüft das per Smoke-Test unten und schlägt dann LAUT fehl statt still kaputt.
+# Fallback auf eine feste Version: LIGHTPANDA_TAG=v0.2.6 setzen (v0.2.6 hat
+# noch das alte CLI mit --timeout, kommt also ohne Shim aus — ältere Website-
+# Kompatibilität).
+ARG LIGHTPANDA_TAG=nightly
+RUN npm install -g agent-browser && \
+    mkdir -p /opt/lightpanda && \
+    curl -fsSL -o /opt/lightpanda/lightpanda \
+      "https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_TAG}/lightpanda-x86_64-linux" && \
+    chmod +x /opt/lightpanda/lightpanda
+COPY lightpanda-shim.sh /usr/local/bin/lightpanda
+RUN chmod +x /usr/local/bin/lightpanda && \
+    lightpanda version && \
+    agent-browser --version && \
+    ( lightpanda serve --port 9222 --timeout 15000 & \
+      LP_PID=$!; \
+      sleep 3; \
+      curl -fsS http://127.0.0.1:9222/json/version > /dev/null || \
+        { echo "LIGHTPANDA/CDP-SMOKE-TEST FEHLGESCHLAGEN — Shim vs. Lightpanda-Argumente prüfen"; kill $LP_PID; exit 1; }; \
+      kill $LP_PID )
+
 # Install hermes-agent (provides the `hermes` CLI) and pre-build its React
 # dashboard so `hermes dashboard` has nothing to build at runtime.
 #

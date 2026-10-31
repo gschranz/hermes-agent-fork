@@ -1,14 +1,23 @@
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+# Python 3.14 is REQUIRED, not cosmetic. Every direct dependency in hermes-agent
+# v0.22.5's pyproject.toml carries a `python_version >= '3.14'` marker (46 of 47;
+# only uvloop is unguarded). On 3.12/3.13 `uv pip install` therefore resolves to
+# an EMPTY runtime dependency set: no openai, no ruamel, no rich — the `hermes`
+# CLI dies on `import ruamel` and only a stubbed `--version` still answers.
+# Verified live: v0.22.5 on 3.12 → broken CLI; on 3.14 → full CLI + imports OK.
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim
 
 # Which hermes-agent revision to install. Accepts any git ref the upstream
 # repo publishes — a release tag (recommended for reproducibility) or a
 # branch name (`main`) for bleeding edge.
 #
 # To bump: check https://github.com/NousResearch/hermes-agent/releases for the
-# newest tag (format `vYYYY.M.D`, e.g. `v2026.4.23`) and update the default
-# below. Use `main` only if you accept that every rebuild can pull arbitrary
-# new upstream commits.
-ARG HERMES_REF=v2026.5.16
+# newest tag and update the default below. NOTE: upstream changed the tag scheme
+# — releases up to ~2026.09 used `vYYYY.M.D` (e.g. v2026.9.24), the current
+# series is `v0.NN.N` (e.g. v0.22.5). Do not sort the two schemes against each
+# other as strings; check the release page for what is actually newest.
+# Use `main` only if you accept that every rebuild can pull arbitrary new
+# upstream commits.
+ARG HERMES_REF=v0.22.5
 
 # tini = tiny init that we run as PID 1. Without it, hermes's grandchild
 # processes (MCP stdio servers, git, bun, browser daemons spawned by tools)
@@ -22,11 +31,19 @@ ARG HERMES_REF=v2026.5.16
 # Node.js is required only at build time to compile the Hermes React dashboard.
 # We strip the source + apt lists afterwards to keep the image lean.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates git tini ffmpeg libopus0 \
-        chromium fonts-liberation && \
+    apt-get install -y --no-install-recommends \
+        curl ca-certificates git tini ffmpeg libopus0 \
+        chromium fonts-liberation \
+        procps xz-utils libatomic1 \
+        gcc g++ make cmake pkg-config libffi-dev && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
+# procps/xz-utils/libatomic1 are runtime (upstream's image ships them too; a
+# container without `ps` is painful to debug). The compiler toolchain
+# (gcc g++ make cmake pkg-config libffi-dev) is only needed so `uv pip install`
+# can build any sdist that has no manylinux wheel — it is purged again after the
+# Hermes install below, so it never reaches the shipped layer's final state.
 
 # --- Chromium: vollständige Browser-Engine für Screenshots und Fallback ------
 # Lightpanda (unten) ist schnell und genügsam, kann aber NICHT screenshotten und
@@ -77,38 +94,60 @@ RUN chmod +x /usr/local/bin/lightpanda && \
 # Install hermes-agent (provides the `hermes` CLI) and pre-build its React
 # dashboard so `hermes dashboard` has nothing to build at runtime.
 #
-# [all] in v2026.5.16: cron, cli, dev, pty, mcp, homeassistant, sms, acp,
-# google, web, youtube. Messaging platforms, TTS, and other heavy backends
-# are now lazy-installed by hermes at first use. We pre-install the ones
-# this template actually uses so first-message latency is instant.
-# When bumping HERMES_REF, re-check hermes-agent's pyproject.toml [all] and
-# the extras below against the new release's pyproject.toml.
+# Extras MUST be re-checked on every HERMES_REF bump — upstream retires them and
+# a stale name makes `uv pip install` fail outright. For v0.22.5:
+#   * `all` = cron, pty, mcp, uvloop, sms, acp, google, web, youtube
+#   * `honcho` and `hindsight` were REMOVED upstream (honcho moved into its own
+#     plugin) — they are deliberately no longer in the list below.
+# Messaging platforms, TTS and other heavy backends are lazy-installed by hermes
+# at first use. We pre-install the ones this template actually uses so
+# first-message latency is instant.
+# INSTALL MODEL — locked, not freshly resolved.
+# Upstream ships a `uv.lock` (1.2 MB, exact-pinned) and expects installs to go
+# through it (`hermes pm lock`). A fresh resolve of `-e ".[all,...]"` is
+# UNSATISFIABLE on v0.22.5:
+#     browser-harness==0.1.13  pins pillow==12.3.0
+#     hermes-agent (base)      pins pillow==13.0.0
+#   -> `uv pip install -e ".[all,...]"` aborts with "No solution found".
+# (The very same extras resolve fine through the lock — proven both ways.)
+# So: `uv export` renders the lock to exact-pinned requirements, we install those
+# into the system interpreter, then add hermes itself editable with --no-deps so
+# /opt/hermes-agent stays the live source tree (needed for HERMES_TUI_DIR and the
+# pre-built hermes_cli/web_dist).
+# Verified locally against v0.22.5 on Python 3.14: export -> 423 pinned lines,
+# deps install rc=0, editable install rc=0, `hermes --version` -> v0.22.5,
+# `import hermes_cli.main / tools.browser_tool / gateway.run` all OK.
 RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
     cd /opt/hermes-agent && \
-    uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,hindsight]" && \
+    uv export --frozen --no-emit-project --no-hashes \
+        --extra all --extra messaging --extra tts-premium \
+        --extra bedrock --extra anthropic --extra edge-tts \
+        -o /tmp/hermes-reqs.txt && \
+    uv pip install --system --no-cache -r /tmp/hermes-reqs.txt && \
+    uv pip install --system --no-cache --no-deps -e . && \
+    printf 'docker\n' > /opt/hermes-agent/.install_method && \
     cd /opt/hermes-agent/web && \
     npm install --silent && \
     npm run build && \
     cd /opt/hermes-agent/ui-tui && \
     npm install --silent --no-fund --no-audit --progress=false && \
     npm run build && \
-    rm -rf /opt/hermes-agent/web /opt/hermes-agent/.git /root/.npm
+    rm -rf /opt/hermes-agent/web /opt/hermes-agent/.git /root/.npm /tmp/hermes-reqs.txt
 
-# --- Fix: Chromium-Flags nicht an Lightpanda geben ---------------------------
-# Hermes injiziert als root automatisch
+# --- Browser: Chromium-Flag-Patch entfällt ab v0.22.5 ------------------------
+# Hermes ≤0.14 injizierte als root automatisch
 #   AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"
-# (tools/browser_tool.py, _needs_sandbox_bypass). Das sind Chrome-Flags, und
-# Lightpanda lehnt sie ab:
-#   "Custom Chrome arguments (--args) are not supported with Lightpanda"
-# Folge: JEDER Browser-Befehl schlug fehl, Hermes startete den Chrome-Fallback,
-# und ohne Chromium endete das in
-#   "Chrome fallback failed: could not determine current URL"
-# Das Skript hängt `and engine != "lightpanda"` an den Injection-Guard und lässt
-# den BUILD LAUT fehlschlagen, falls Upstream den Block je umbaut (gleiche
-# Philosophie wie der CDP-Smoke-Test oben) — statt still ein kaputtes
-# Browser-Toolset auszuliefern. Idempotent.
-COPY patch-browser-engine.py /app/patch-browser-engine.py
-RUN python3 /app/patch-browser-engine.py
+# (tools/browser_tool.py, _needs_sandbox_bypass). Das sind Chrome-Flags und
+# Lightpanda lehnt sie ab ("Custom Chrome arguments (--args) are not supported
+# with Lightpanda") — jeder Browser-Befehl scheiterte. patch-browser-engine.py
+# hat das geradegezogen.
+#
+# v0.22.5 hat den Browser-Stack neu gebaut: browser_tool.py schrumpfte von 3676
+# auf ~1376 Zeilen, die Fallback-Logik zog in tools/browser_tool_lightpanda_fallback
+# um, und die Injection ist ersatzlos verschwunden. Der Patch hätte keinen Anker
+# mehr und würde den Build ABSICHTLICH sprengen (sein Design). Darum ist der
+# Schritt hier entfernt. Das Skript bleibt im Repo, falls je auf einen ≤0.14-Zweig
+# zurückgegangen wird.
 
 # Why pre-build ui-tui (and why we don't delete it after):
 # - The dashboard's embedded Chat tab spawns `node ui-tui/dist/entry.js`
@@ -128,6 +167,13 @@ RUN uv pip install --system --no-cache -r /app/requirements.txt
 # faster-whisper für lokale STT (Speech-to-Text) — wird von Hermes für
 # Sprachnachrichten-Transkription verwendet, wenn stt.provider=local
 RUN uv pip install --system --no-cache faster-whisper
+
+# Drop the compile-only toolchain — must come AFTER every pip install, since any
+# of them can still pull an sdist that needs building. Only the compilers are
+# purged (no --auto-remove) so nothing runtime-relevant (libffi8, libatomic1,
+# procps) gets swept along by dependency resolution.
+RUN apt-get purge -y gcc g++ make cmake pkg-config libffi-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /data/.hermes
 

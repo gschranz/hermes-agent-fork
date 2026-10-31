@@ -1,39 +1,42 @@
 #!/usr/bin/env python3
-"""Make Hermes' Chromium sandbox-flag injection engine-aware.
+"""Keep Hermes from handing Chromium-only launch flags to Lightpanda.
 
 WHY
 ---
-tools/browser_tool.py injects
+``tools/browser_tool.py`` injects
 
     AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"
 
-whenever it runs as root (or on an AppArmor userns-restricted host) — see the
+whenever it runs as root (or on an AppArmor userns-restricted host) — the
 ``_needs_sandbox_bypass`` block. Those are Chromium launch flags.
 
 With ``browser.engine: lightpanda``, agent-browser forwards them to Lightpanda,
-which rejects them outright:
+which rejects them:
 
     {"error":"Custom Chrome arguments (--args) are not supported with Lightpanda",
      "success":false}
 
-So *every* browser command "fails", Hermes starts its Chrome fallback, and with
-no Chromium path available it surfaces:
+Failure chain observed live (2026-10-31):
+  * ``open`` fails -> Hermes triggers its Chrome fallback -> with no Chromium it
+    dies with "Chrome fallback failed: could not determine current URL";
+  * and even *with* Chromium, the fallback's own URL probe re-runs ``eval`` with
+    ``_engine_override="auto"``. That "auto" call talks to the **existing
+    Lightpanda daemon** (agent-browser locks the engine per session) — so unless
+    the guard also looks at the *configured* engine, the same Chromium flags get
+    injected again and the probe fails identically:
+        EVAL auto: {"error":"Custom Chrome arguments (--args) are not supported
+                    with Lightpanda","success":false}
 
-    Chrome fallback failed: could not determine current URL
+Hence the injection must be skipped whenever the session's real engine is
+Lightpanda — which is true when *either* the per-call override *or* the
+configured engine is ``lightpanda``.
 
-...even though ``agent-browser --engine lightpanda open <url>`` works perfectly
-by hand. (Verified 2026-10-31 in the live container.)
+Idempotent and upgrade-aware. Handles three on-disk states and fails the *image
+build* loudly if upstream rewrites the block (same philosophy as the Lightpanda
+CDP smoke-test in the Dockerfile) rather than silently shipping a broken browser
+stack.
 
-FIX
----
-Add ``and engine != "lightpanda"`` to the injection guard: Lightpanda sessions
-never receive Chromium-only flags; chrome / Chrome-for-Testing sessions keep
-their ``--no-sandbox`` behaviour unchanged.
-
-Idempotent — re-running on an already-patched file is a no-op. Exits 1 if the
-expected block is absent, so a HERMES_REF bump that rewrites the block fails the
-*image build* loudly instead of silently shipping a broken browser stack (same
-philosophy as the Lightpanda CDP smoke-test in the Dockerfile).
+Usage: patch-browser-engine.py [path]   (default /opt/hermes-agent/tools/browser_tool.py)
 """
 from __future__ import annotations
 
@@ -41,15 +44,26 @@ import sys
 
 PATH = sys.argv[1] if len(sys.argv) > 1 else "/opt/hermes-agent/tools/browser_tool.py"
 
-OLD = '''        if (
+# State A — pristine upstream.
+STATE_A = '''        if (
             "AGENT_BROWSER_ARGS" not in browser_env
             and "AGENT_BROWSER_CHROME_FLAGS" not in browser_env
         ):'''
 
-NEW = '''        if (
+# State B — first-generation patch (override only). Insufficient: the "auto"
+# fallback probe still reached a Lightpanda daemon and got the Chrome flags.
+STATE_B = '''        if (
             "AGENT_BROWSER_ARGS" not in browser_env
             and "AGENT_BROWSER_CHROME_FLAGS" not in browser_env
             and engine != "lightpanda"
+        ):'''
+
+# State C — correct. Checks both the override and the configured engine.
+STATE_C = '''        if (
+            "AGENT_BROWSER_ARGS" not in browser_env
+            and "AGENT_BROWSER_CHROME_FLAGS" not in browser_env
+            and engine != "lightpanda"
+            and _get_browser_engine() != "lightpanda"
         ):'''
 
 
@@ -60,28 +74,34 @@ def main() -> int:
         print(f"patch-browser-engine: cannot read {PATH}: {e}", file=sys.stderr)
         return 1
 
-    if NEW in src:
-        print("patch-browser-engine: already applied — nothing to do")
+    if STATE_C in src:
+        print("patch-browser-engine: up to date (state C) — nothing to do")
         return 0
 
-    found = src.count(OLD)
-    if found != 1:
+    if src.count(STATE_A) == 1:
+        src = src.replace(STATE_A, STATE_C, 1)
+        note = "A -> C (pristine)"
+    elif src.count(STATE_B) == 1:
+        src = src.replace(STATE_B, STATE_C, 1)
+        note = "B -> C (upgraded incomplete patch)"
+    else:
         print(
-            f"patch-browser-engine: FAILED — expected exactly 1 match of the "
-            f"injection guard, found {found}. Upstream browser_tool.py changed; "
-            f"re-inspect the _needs_sandbox_bypass block and update this patch.",
+            "patch-browser-engine: FAILED — found neither the pristine nor the "
+            f"intermediate injection guard (A={src.count(STATE_A)}, "
+            f"B={src.count(STATE_B)}). Upstream browser_tool.py changed; "
+            "re-inspect the _needs_sandbox_bypass block and update this patch.",
             file=sys.stderr,
         )
         return 1
 
     with open(PATH, "w", encoding="utf-8") as fh:
-        fh.write(src.replace(OLD, NEW, 1))
+        fh.write(src)
 
-    if NEW not in open(PATH, encoding="utf-8").read():
+    if STATE_C not in open(PATH, encoding="utf-8").read():
         print("patch-browser-engine: FAILED — write verification failed", file=sys.stderr)
         return 1
 
-    print("patch-browser-engine: applied (lightpanda no longer gets Chromium flags)")
+    print(f"patch-browser-engine: applied ({note}) — Lightpanda never gets Chromium flags")
     return 0
 
 

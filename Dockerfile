@@ -22,10 +22,25 @@ ARG HERMES_REF=v2026.5.16
 # Node.js is required only at build time to compile the Hermes React dashboard.
 # We strip the source + apt lists afterwards to keep the image lean.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates git tini ffmpeg libopus0 && \
+    apt-get install -y --no-install-recommends curl ca-certificates git tini ffmpeg libopus0 \
+        chromium fonts-liberation && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
+
+# --- Chromium: vollständige Browser-Engine für Screenshots und Fallback ------
+# Lightpanda (unten) ist schnell und genügsam, kann aber NICHT screenshotten und
+# scheitert an JS-lastigen Seiten. Chromium ist die vollwertige Engine:
+#   * agent-browser --engine chrome  -> echte Screenshots, volles DOM
+#   * Hermes' automatischer Lightpanda->Chrome-Fallback braucht eine Chromium-
+#     Installation, sonst endet jeder Fallback in
+#     "Chrome fallback failed: could not determine current URL".
+# apt-chromium (~348 MB in /usr/lib/chromium) liegt IM Image und überlebt damit
+# jeden Volume-Wipe — anders als `agent-browser install`, das ~650 MB Chrome for
+# Testing ins Volume /data lädt und dort beim Aufräumen verschwindet.
+# Als root braucht Chromium --no-sandbox; das injiziert Hermes selbst (siehe
+# patch-browser-engine.py weiter unten).
+
 
 # --- Browser-Automation ohne Chromium-Ballast -------------------------------
 # Hermes' Browser-Toolset spricht die CLI `agent-browser` an. Standard-Engine ist
@@ -78,6 +93,22 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
     npm install --silent --no-fund --no-audit --progress=false && \
     npm run build && \
     rm -rf /opt/hermes-agent/web /opt/hermes-agent/.git /root/.npm
+
+# --- Fix: Chromium-Flags nicht an Lightpanda geben ---------------------------
+# Hermes injiziert als root automatisch
+#   AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"
+# (tools/browser_tool.py, _needs_sandbox_bypass). Das sind Chrome-Flags, und
+# Lightpanda lehnt sie ab:
+#   "Custom Chrome arguments (--args) are not supported with Lightpanda"
+# Folge: JEDER Browser-Befehl schlug fehl, Hermes startete den Chrome-Fallback,
+# und ohne Chromium endete das in
+#   "Chrome fallback failed: could not determine current URL"
+# Das Skript hängt `and engine != "lightpanda"` an den Injection-Guard und lässt
+# den BUILD LAUT fehlschlagen, falls Upstream den Block je umbaut (gleiche
+# Philosophie wie der CDP-Smoke-Test oben) — statt still ein kaputtes
+# Browser-Toolset auszuliefern. Idempotent.
+COPY patch-browser-engine.py /app/patch-browser-engine.py
+RUN python3 /app/patch-browser-engine.py
 
 # Why pre-build ui-tui (and why we don't delete it after):
 # - The dashboard's embedded Chat tab spawns `node ui-tui/dist/entry.js`
